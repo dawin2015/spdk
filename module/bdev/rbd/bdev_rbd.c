@@ -79,6 +79,7 @@ struct bdev_rbd {
 
 struct bdev_rbd_io_channel {
 	struct bdev_rbd *disk;
+	uint64_t io_inflight;
 };
 
 struct bdev_rbd_io {
@@ -427,6 +428,8 @@ bdev_rbd_start_aio(struct bdev_rbd *disk, struct spdk_bdev_io *bdev_io,
 		   struct iovec *iov, int iovcnt, uint64_t offset, size_t len)
 {
 	int ret;
+	struct spdk_io_channel *ch;
+	struct bdev_rbd_io_channel *rbd_io_ch;
 	struct bdev_rbd_io *rbd_io = (struct bdev_rbd_io *)bdev_io->driver_ctx;
 	rbd_image_t image = disk->image;
 
@@ -461,7 +464,9 @@ bdev_rbd_start_aio(struct bdev_rbd *disk, struct spdk_bdev_io *bdev_io,
 		rbd_aio_release(rbd_io->comp);
 		goto err;
 	}
-
+	ch = bdev_rbd_get_io_channel(disk);
+	rbd_io_ch = spdk_io_channel_get_ctx(ch);
+	rbd_io_ch->io_inflight++;
 	return;
 
 err:
@@ -486,6 +491,33 @@ static struct spdk_bdev_module rbd_if = {
 };
 SPDK_BDEV_MODULE_REGISTER(rbd, &rbd_if)
 
+static void
+_bdev_rbd_get_io_inflight_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct bdev_rbd *disk = spdk_io_channel_iter_get_ctx(i);
+
+	if (status == -1) {
+		disk->reset_timer = SPDK_POLLER_REGISTER(bdev_rbd_reset_timer, disk, 1 * 1000 * 1000);
+		return;
+	}
+
+	bdev_rbd_io_complete(disk->reset_bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+}
+
+static void
+_bdev_rbd_get_io_inflight(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct bdev_rbd_io_channel *rbd_io_ch = spdk_io_channel_get_ctx(ch);
+
+	if (rbd_io_ch->io_inflight) {
+		spdk_for_each_channel_continue(i, -1);
+		return;
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
 static int
 bdev_rbd_reset_timer(void *arg)
 {
@@ -495,9 +527,13 @@ bdev_rbd_reset_timer(void *arg)
 	 * TODO: This should check if any I/O is still in flight before completing the reset.
 	 * For now, just complete after the timer expires.
 	 */
-	bdev_rbd_io_complete(disk->reset_bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
-	spdk_poller_unregister(&disk->reset_timer);
-	disk->reset_bdev_io = NULL;
+	if (disk->reset_timer) {
+		spdk_poller_unregister(&disk->reset_timer);
+	}
+	spdk_for_each_channel(disk,
+						  _bdev_rbd_get_io_inflight,
+						  disk,
+						  _bdev_rbd_get_io_inflight_done);
 
 	return SPDK_POLLER_BUSY;
 }
@@ -511,7 +547,7 @@ bdev_rbd_reset(struct bdev_rbd *disk, struct spdk_bdev_io *bdev_io)
 	 */
 	assert(disk->reset_bdev_io == NULL);
 	disk->reset_bdev_io = bdev_io;
-	disk->reset_timer = SPDK_POLLER_REGISTER(bdev_rbd_reset_timer, disk, 1 * 1000 * 1000);
+	bdev_rbd_reset_timer(disk);
 }
 
 static void
